@@ -1,7 +1,6 @@
 # Rust
 server/target/
 **/*.rs.bk
-Cargo.lock
 
 # Database
 *.db
