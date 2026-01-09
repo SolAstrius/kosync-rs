@@ -15,37 +15,29 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-      in
-      {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+
+        commonArgs = {
           pname = "kosync-server";
           version = "0.1.0";
-
           src = ./server;
-
-          cargoLock = {
-            lockFile = ./server/Cargo.lock;
-          };
-
+          cargoLock.lockFile = ./server/Cargo.lock;
           meta = with pkgs.lib; {
             description = "KOReader sync server with extended annotation support";
             homepage = "https://github.com/SolAstrius/kosync-rs";
             license = licenses.agpl3Only;
-            maintainers = [ ];
             mainProgram = "kosync-server";
           };
+        };
+      in
+      {
+        packages = {
+          default = pkgs.rustPlatform.buildRustPackage commonArgs;
+          static = pkgs.pkgsStatic.rustPlatform.buildRustPackage commonArgs;
         };
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
-
-          packages = with pkgs; [
-            cargo
-            rustc
-            rust-analyzer
-            clippy
-            rustfmt
-          ];
+          packages = with pkgs; [ cargo rustc rust-analyzer clippy rustfmt ];
         };
       }
     );
