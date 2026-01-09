@@ -191,6 +191,13 @@ function KOSyncExtClient:get_annotations(username, password, document, callback)
 end
 
 function KOSyncExtClient:update_annotations(username, password, document, annotations, deleted, base_version, callback)
+    logger.info("KOSyncExtClient:update_annotations called")
+    logger.info("  document:", document)
+    logger.info("  annotations type:", type(annotations))
+    logger.info("  annotations count:", annotations and #annotations or "nil")
+    logger.info("  deleted type:", type(deleted))
+    logger.info("  base_version:", base_version)
+
     self.client:reset_middlewares()
     self.client:enable("Format.JSON")
     self.client:enable("GinClient")
@@ -200,19 +207,26 @@ function KOSyncExtClient:update_annotations(username, password, document, annota
     })
     socketutil:set_timeout(ANNOTATION_TIMEOUTS[1], ANNOTATION_TIMEOUTS[2])
     local co = coroutine.create(function()
+        logger.info("KOSyncExtClient: inside coroutine, calling client:update_annotations")
         local ok, res = pcall(function()
-            return self.client:update_annotations({
+            logger.info("KOSyncExtClient: inside pcall, about to call API")
+            local result = self.client:update_annotations({
                 document = document,
                 annotations = annotations,
                 deleted = deleted,
                 base_version = base_version,
             })
+            logger.info("KOSyncExtClient: API call returned, result type:", type(result))
+            return result
         end)
+        logger.info("KOSyncExtClient: pcall returned, ok:", ok, "res type:", type(res))
         if ok then
+            logger.info("KOSyncExtClient: res.status:", res and res.status)
+            logger.info("KOSyncExtClient: res.body:", res and res.body)
             callback(res.status == 200, res.body)
         else
-            logger.dbg("KOSyncExtClient:update_annotations failure:", res)
-            callback(false, res.body)
+            logger.info("KOSyncExtClient:update_annotations failure:", res)
+            callback(false, nil)
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})

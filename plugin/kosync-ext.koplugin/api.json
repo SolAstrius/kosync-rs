@@ -63,6 +63,9 @@
                 "annotations",
                 "deleted"
             ],
+            "optional_params": [
+                "base_version"
+            ],
             "payload": [
                 "annotations",
                 "deleted",

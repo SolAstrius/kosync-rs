@@ -53,6 +53,7 @@ KOSyncExt.default_settings = {
     userkey = nil,
     auto_sync = false,
     sync_annotations = true,
+    pages_before_update = nil,  -- nil = disabled, number = sync every N pages
     sync_forward = SYNC_STRATEGY.PROMPT,
     sync_backward = SYNC_STRATEGY.DISABLE,
     checksum_method = CHECKSUM_METHOD.BINARY,
@@ -64,6 +65,12 @@ function KOSyncExt:init()
     self.annotations_version = 0
     self.deleted_annotations = {}
 
+    -- Page update tracking
+    self.last_page = nil
+    self.page_update_counter = 0
+    self.periodic_push_scheduled = false
+    self.last_page_turn_timestamp = 0
+
     self.settings = G_reader_settings:readSetting("kosync_ext", self.default_settings)
     self.device_id = G_reader_settings:readSetting("device_id")
 
@@ -71,8 +78,8 @@ function KOSyncExt:init()
 end
 
 function KOSyncExt:addToMainMenu(menu_items)
-    menu_items.progress_sync_ext = {
-        text = _("Extended Sync"),
+    menu_items.progress_sync = {
+        text = _("Progress sync"),
         sub_item_table = {
             {
                 text = _("Custom sync server"),
@@ -112,6 +119,40 @@ function KOSyncExt:addToMainMenu(menu_items)
                 callback = function()
                     self.settings.auto_sync = not self.settings.auto_sync
                     self:registerEvents()
+                end,
+            },
+            {
+                text_func = function()
+                    return T(_("Sync every # pages (%1)"), self:getSyncPeriod())
+                end,
+                enabled_func = function() return self.settings.auto_sync end,
+                help_text = _([[Periodically sync progress while reading. Only works if network is already connected.]]),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local curr_value = self.settings.pages_before_update or 0
+                    local spin_widget = SpinWidget:new{
+                        value = curr_value,
+                        value_min = 0,
+                        value_max = 999,
+                        value_step = 1,
+                        value_hold_step = 10,
+                        ok_text = _("Set"),
+                        ok_always_enabled = true,
+                        title_text = _("Sync every # pages"),
+                        info_text = _("Set to 0 to disable periodic sync."),
+                        default_value = 0,
+                        callback = function(spin)
+                            local value = spin.value
+                            if value == 0 then
+                                self.settings.pages_before_update = nil
+                            else
+                                self.settings.pages_before_update = value
+                            end
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    }
+                    UIManager:show(spin_widget)
                 end,
             },
             {
@@ -172,6 +213,16 @@ function KOSyncExt:setCustomServer(server)
     self.settings.custom_server = server ~= "" and server or nil
 end
 
+function KOSyncExt:getSyncPeriod()
+    if not self.settings.auto_sync then
+        return _("N/A")
+    end
+    if not self.settings.pages_before_update then
+        return _("off")
+    end
+    return tostring(self.settings.pages_before_update)
+end
+
 function KOSyncExt:onReaderReady()
     if self.settings.auto_sync then
         UIManager:nextTick(function()
@@ -179,20 +230,109 @@ function KOSyncExt:onReaderReady()
         end)
     end
     self:registerEvents()
+    self.last_page = self.ui:getCurrentPage()
 end
 
 function KOSyncExt:registerEvents()
     if self.settings.auto_sync then
         self.onCloseDocument = self._onCloseDocument
+        self.onPageUpdate = self._onPageUpdate
+        self.onResume = self._onResume
+        self.onSuspend = self._onSuspend
+        self.onNetworkConnected = self._onNetworkConnected
+        self.onNetworkDisconnecting = self._onNetworkDisconnecting
     else
         self.onCloseDocument = nil
+        self.onPageUpdate = nil
+        self.onResume = nil
+        self.onSuspend = nil
+        self.onNetworkConnected = nil
+        self.onNetworkDisconnecting = nil
     end
 end
 
 function KOSyncExt:_onCloseDocument()
+    logger.dbg("KOSyncExt: onCloseDocument")
+    -- Disable other handlers to prevent duplicate syncs
+    self.onResume = nil
+    self.onSuspend = nil
+    self.onNetworkConnected = nil
+    self.onNetworkDisconnecting = nil
+    self.onPageUpdate = nil
+
     NetworkMgr:goOnlineToRun(function()
         self:pushAll(false)
     end)
+end
+
+function KOSyncExt:_onPageUpdate(page)
+    if page == nil then
+        return
+    end
+
+    if self.last_page ~= page then
+        self.last_page = page
+        self.last_page_turn_timestamp = os.time()
+        self.page_update_counter = self.page_update_counter + 1
+
+        -- Schedule push if we've reached the page threshold or one is already scheduled
+        if self.periodic_push_scheduled or
+           (self.settings.pages_before_update and self.page_update_counter >= self.settings.pages_before_update) then
+            self:schedulePeriodicPush()
+        end
+    end
+end
+
+function KOSyncExt:schedulePeriodicPush()
+    -- Only sync if network is already up (don't trigger wifi connection)
+    if not NetworkMgr:isOnline() then
+        return
+    end
+
+    self.periodic_push_scheduled = true
+
+    -- Debounce: wait for user to stop turning pages
+    UIManager:unschedule(self.doPushCallback)
+    self.doPushCallback = function()
+        -- Only push if enough time has passed since last page turn (user is idle)
+        if os.time() - self.last_page_turn_timestamp >= 3 then
+            self.periodic_push_scheduled = false
+            self.page_update_counter = 0
+            self:pushAll(false)
+        else
+            -- User still turning pages, reschedule
+            UIManager:scheduleIn(3, self.doPushCallback)
+        end
+    end
+    UIManager:scheduleIn(3, self.doPushCallback)
+end
+
+function KOSyncExt:_onResume()
+    logger.dbg("KOSyncExt: onResume")
+    -- Pull progress when resuming from suspend
+    UIManager:scheduleIn(1, function()
+        self:pullAll(false)
+    end)
+end
+
+function KOSyncExt:_onSuspend()
+    logger.dbg("KOSyncExt: onSuspend")
+    -- Push progress before suspending (network should still be up)
+    self:pushAll(false)
+end
+
+function KOSyncExt:_onNetworkConnected()
+    logger.dbg("KOSyncExt: onNetworkConnected")
+    -- Pull when network comes up
+    UIManager:scheduleIn(0.5, function()
+        self:pullAll(false)
+    end)
+end
+
+function KOSyncExt:_onNetworkDisconnecting()
+    logger.dbg("KOSyncExt: onNetworkDisconnecting")
+    -- Push before network goes down
+    self:pushAll(false)
 end
 
 -- === Auth ===
@@ -368,7 +508,9 @@ end
 -- === Push/Pull All ===
 
 function KOSyncExt:pushAll(interactive)
+    logger.info("KOSyncExt: pushAll called, interactive:", interactive)
     if not self.settings.username or not self.settings.userkey then
+        logger.warn("KOSyncExt: not logged in")
         if interactive then
             UIManager:show(InfoMessage:new{
                 text = _("Please login first."),
@@ -378,8 +520,11 @@ function KOSyncExt:pushAll(interactive)
         return
     end
 
+    logger.info("KOSyncExt: pushing progress...")
     self:pushProgress(interactive)
+    logger.info("KOSyncExt: sync_annotations =", self.settings.sync_annotations)
     if self.settings.sync_annotations then
+        logger.info("KOSyncExt: pushing annotations...")
         self:pushAnnotations(interactive)
     end
 end
@@ -521,14 +666,37 @@ function KOSyncExt:setLocalAnnotations(annotations)
 end
 
 function KOSyncExt:pushAnnotations(interactive)
+    logger.info("KOSyncExt: pushAnnotations START")
     local KOSyncExtClient = require("KOSyncExtClient")
+    logger.info("KOSyncExt: got client module")
     local client = KOSyncExtClient:new{
         custom_url = self.settings.custom_server,
         service_spec = self.path .. "/api.json"
     }
+    logger.info("KOSyncExt: created client, path:", self.path)
     local doc_digest = self:getDocumentDigest()
+    logger.info("KOSyncExt: doc_digest:", doc_digest)
     local annotations = self:getLocalAnnotations()
+    logger.info("KOSyncExt: annotations count:", #annotations)
 
+    -- Debug: dump structure of first annotation
+    if #annotations > 0 then
+        local first = annotations[1]
+        logger.info("KOSyncExt: first annotation keys:")
+        for k, v in pairs(first) do
+            logger.info("  ", k, "=", type(v), ":", tostring(v):sub(1, 100))
+        end
+    end
+
+    -- Try to serialize manually to test
+    local JSON = require("json")
+    local ok_json, json_str = pcall(JSON.encode, {annotations = annotations, deleted = self.deleted_annotations or {}})
+    logger.info("KOSyncExt: JSON encode test:", ok_json, json_str and #json_str or "nil")
+    if not ok_json then
+        logger.info("KOSyncExt: JSON encode error:", json_str)
+    end
+
+    logger.info("KOSyncExt: calling update_annotations...")
     local ok, err = pcall(client.update_annotations,
         client,
         self.settings.username,
@@ -538,6 +706,7 @@ function KOSyncExt:pushAnnotations(interactive)
         self.deleted_annotations or {},
         self.annotations_version,
         function(ok, body)
+            logger.info("KOSyncExt: callback received, ok:", ok, "body:", body)
             logger.dbg("KOSyncExt: push annotations", #annotations, "items")
             if ok and body then
                 self.annotations_version = body.version or 0
@@ -554,11 +723,15 @@ function KOSyncExt:pushAnnotations(interactive)
                 end
             end
         end)
-    if not ok and interactive then
-        UIManager:show(InfoMessage:new{
-            text = _("Failed to push annotations: ") .. tostring(err),
-            timeout = 2,
-        })
+    logger.info("KOSyncExt: pcall returned, ok:", ok, "err:", err)
+    if not ok then
+        logger.warn("KOSyncExt: pushAnnotations FAILED:", err)
+        if interactive then
+            UIManager:show(InfoMessage:new{
+                text = _("Failed to push annotations: ") .. tostring(err),
+                timeout = 2,
+            })
+        end
     end
 end
 
